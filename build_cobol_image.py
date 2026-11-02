@@ -10,13 +10,14 @@ Python 3 and the other required utilities. This script does NOT:
   - invoke Docker or require access to the Docker daemon
 
 It validates the checked-out project, builds the COBOL application, generates
-sample data, runs the application and executes the automated test suite.
+sample data, runs the application, executes the automated test suite and\ngenerates a SHA-256 checksum for the compiled executable.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import os
 import shutil
 import subprocess
@@ -261,6 +262,33 @@ def validate_runtime(logger: Logger) -> None:
         logger.debug(f"{command}: {shutil.which(command)}")
 
 
+
+def generate_artifact_checksum(project: Path, logger: Logger, summary: RunSummary) -> Path:
+    """Generate a SHA-256 checksum for the compiled COBOL executable."""
+    artifact = project / "build" / "banking-app"
+    checksum_file = project / "build" / "banking-app.sha256"
+
+    with summary.stage("Artifact checksum generation"):
+        if not artifact.is_file():
+            raise FileNotFoundError(
+                f"Compiled artifact not found: {artifact}. Run the build stage first."
+            )
+
+        digest = hashlib.sha256()
+        with artifact.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+
+        checksum = digest.hexdigest()
+        checksum_file.write_text(
+            f"{checksum}  {artifact.name}\\n",
+            encoding="utf-8",
+        )
+        logger.pass_(f"SHA-256: {checksum}")
+        logger.pass_(f"Checksum file generated: {checksum_file}")
+        return checksum_file
+
+
 def run_application(project: Path, logger: Logger, summary: RunSummary) -> None:
     stages = [
         ("make clean", ["make", "clean"], "INFO"),
@@ -319,6 +347,7 @@ def main() -> int:
             summary.skipped("COBOL application tests", "Skipped by --skip-app-tests")
         else:
             run_application(project, logger, summary)
+            generate_artifact_checksum(project, logger, summary)
 
         logger.pass_("COBOL application validation completed successfully.")
         exit_code = 0

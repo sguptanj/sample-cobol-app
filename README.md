@@ -31,10 +31,10 @@ make data
 Sample data/transcation.dat
 1000000001C000025000
 
-Position	Length	Field
-1–10	10	Account number
-11	1	Transaction type
-12–20	9	Transaction amount
+Field Name,Position Range,Length,Raw Value,Parsed Value / Description
+Account Number,1–10,10,1000000001,Account ID 1000000001
+Transaction Type,11,1,C,Credit (C) transaction
+Transaction Amount,12–20,9,000025000,"25,000.00 (implied 2 decimal places)"
 
 ## Execute application
 

@@ -28,6 +28,14 @@ make build
 
 make data
 
+Sample data/transcation.dat
+1000000001C000025000
+
+Position	Length	Field
+1–10	10	Account number
+11	1	Transaction type
+12–20	9	Transaction amount
+
 ## Execute application
 
 make run

@@ -31,11 +31,17 @@ make data
 Sample data/transcation.dat
 1000000001C000025000
 
-Field Name,Position Range,Length,Raw Value,Parsed Value / Description
-Account Number,1–10,10,1000000001,Account ID 1000000001
-Transaction Type,11,1,C,Credit (C) transaction
-Transaction Amount,12–20,9,000025000,"25,000.00 (implied 2 decimal places)"
+## 💳 Transaction Record Layout (`data/transactions.dat`)
 
+| Position Range | Length | Field Name | Raw Example | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **1–10** | 10 | Account Number | `1000000001` | Unique customer account identifier |
+| **11** | 1 | Transaction Type | `C` | Type of transaction (`C` for Credit, `D` for Debit) |
+| **12–20** | 9 | Transaction Amount | `000025000` | Transaction value (with implied decimal places) |
+
+### Example Record Breakdown
+* **Raw Line:** `1000000001C000025000`
+* **Parsed:** Account `1000000001` | Credit (`C`) | Amount: `25,000.00`
 ## Execute application
 
 make run

@@ -42,6 +42,47 @@ Sample data/transcation.dat
 ### Example Record Breakdown
 * **Raw Line:** `1000000001C000025000`
 * **Parsed:** Account `1000000001` | Credit (`C`) | Amount: `25,000.00`
+
+## Transaction Types
+
+The banking application supports the following transaction types:
+
+| Transaction Type | Code | Description |
+|---|---|---|
+| Credit | `C` | Adds the specified amount to the customer's account balance. |
+| Debit | `D` | Deducts the specified amount from the customer's account balance, subject to validation rules. |
+| Invalid | `X` | Represents an unsupported transaction type and is rejected during validation. |
+
+### Transaction Record Format
+
+The application uses fixed-width transaction records with the following structure:
+
+| Field | Position | Length |
+|---|---:|---:|
+| Account Number | 1–10 | 10 characters |
+| Transaction Code | 11 | 1 character |
+| Transaction Amount | 12–20 | 9 characters |
+
+**Example transaction records:**
+
+```text
+1000000001C000025000
+1000000001D000010000
+1000000002D009999999
+1000000002X000001000
+```
+
+### Transaction Validation
+
+Each transaction is validated before processing:
+
+- **Credit:** Validates the account and transaction details before adding the amount.
+- **Debit:** Validates account balance, minimum balance requirements and transaction limits before deduction.
+- **Invalid transaction:** Rejects unsupported transaction codes.
+- **Account validation:** Rejects transactions for accounts that do not exist.
+
+Rejected transactions are recorded with corresponding error codes in the transaction processing output.
+
 ## Execute application
 
 make run

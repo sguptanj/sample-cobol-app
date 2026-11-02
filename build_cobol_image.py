@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Build and validate the Ubuntu 26.04 COBOL CI agent image, then optionally push it.
+Run and validate the COBOL banking application inside the prebuilt
+BuildPiper execution container.
 
-The application validation runs in a temporary copy of the project. This keeps
-`make clean` and generated test files from changing or deleting files in the
-user's working tree.
+The container image is expected to already contain GnuCOBOL, GCC, Make,
+Python 3 and the other required utilities. This script does NOT:
+  - build or inspect a Dockerfile
+  - build, tag or push a Docker image
+  - invoke Docker or require access to the Docker daemon
 
-Examples:
-  ./build_cobol_image.py
-  ./build_cobol_image.py --image cobol-build-agent:ubuntu26
-  ./build_cobol_image.py --push-to docker.io/USERNAME/cobol-build-agent:ubuntu26
-  ./build_cobol_image.py --context /path/to/sample-cobol-app --debug
-
-Registry authentication must be completed separately:
-  docker login
+It validates the checked-out project, builds the COBOL application, generates
+sample data, runs the application and executes the automated test suite.
 """
 
 from __future__ import annotations
@@ -22,32 +19,28 @@ import argparse
 import datetime as dt
 import os
 import shutil
-import signal
 import subprocess
 import sys
-import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
 
 
 class Logger:
-    """Console logger with optional ANSI colors and plain persistent logs."""
-
     COLORS = {
-        "INFO": "\033[32m",       # Green
-        "WARNING": "\033[33m",    # Yellow
-        "ERROR": "\033[31m",      # Red
-        "DEBUG": "\033[36m",      # Cyan
+        "INFO": "\033[36m",
+        "PASS": "\033[32m",
+        "TEST": "\033[32m",
+        "WARNING": "\033[33m",
+        "ERROR": "\033[31m",
+        "DEBUG": "\033[90m",
         "RESET": "\033[0m",
     }
 
     def __init__(self, log_path: Path, *, use_color: bool, debug: bool) -> None:
         self.log_path = log_path
-        self.use_color = (
-            use_color
-            and sys.stdout.isatty()
-            and "NO_COLOR" not in os.environ
-        )
+        self.use_color = use_color and sys.stdout.isatty() and "NO_COLOR" not in os.environ
         self.debug_enabled = debug
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._stream = self.log_path.open("a", encoding="utf-8")
@@ -59,15 +52,20 @@ class Logger:
     def _write(self, level: str, message: str) -> None:
         plain = f"{self.timestamp()} [{level}] {message}"
         color = self.COLORS.get(level, "")
-        reset = self.COLORS["RESET"] if color and self.use_color else ""
         prefix = color if color and self.use_color else ""
-
-        print(f"{prefix}{plain}{reset}", flush=True)
+        suffix = self.COLORS["RESET"] if prefix else ""
+        print(f"{prefix}{plain}{suffix}", flush=True)
         self._stream.write(plain + "\n")
         self._stream.flush()
 
     def info(self, message: str) -> None:
         self._write("INFO", message)
+
+    def pass_(self, message: str) -> None:
+        self._write("PASS", message)
+
+    def test(self, message: str) -> None:
+        self._write("TEST", message)
 
     def warning(self, message: str) -> None:
         self._write("WARNING", message)
@@ -83,29 +81,77 @@ class Logger:
         self._stream.close()
 
 
+class RunSummary:
+    def __init__(self, logger: Logger) -> None:
+        self.logger = logger
+        self.started = time.monotonic()
+        self.results: list[tuple[str, str, float, str]] = []
+        self.overall_status = "RUNNING"
+
+    @contextmanager
+    def stage(self, name: str):
+        started = time.monotonic()
+        self.logger.info(f"========== {name} ==========")
+        try:
+            yield
+        except Exception as exc:
+            self.results.append((name, "FAILED", time.monotonic() - started, str(exc)))
+            raise
+        else:
+            self.results.append((name, "PASSED", time.monotonic() - started, ""))
+
+    def skipped(self, name: str, reason: str) -> None:
+        self.results.append((name, "SKIPPED", 0.0, reason))
+
+    def finish(self, status: str) -> None:
+        self.overall_status = status
+
+    def print_summary(self, log_file: Path) -> None:
+        total = time.monotonic() - self.started
+        self.logger.info("")
+        self.logger.info("============================================================")
+        if self.overall_status == "PASSED":
+            self.logger.pass_("                    EXECUTION SUMMARY")
+        else:
+            self.logger.error("                    EXECUTION SUMMARY")
+        self.logger.info(f"Overall status : {self.overall_status}")
+        self.logger.info(f"Total duration : {total:.2f} seconds")
+        self.logger.info("------------------------------------------------------------")
+        for name, status, duration, detail in self.results:
+            line = f"{name:<30} {status:<8} {duration:>7.2f}s"
+            if status == "PASSED":
+                self.logger.pass_(line)
+            elif status == "FAILED":
+                self.logger.error(line)
+                if detail:
+                    self.logger.error(f"  Reason: {detail}")
+            else:
+                self.logger.warning(line + (f" ({detail})" if detail else ""))
+        self.logger.info("------------------------------------------------------------")
+        self.logger.info(f"Detailed log    : {log_file}")
+        self.logger.info("============================================================")
+
+
 class CommandFailure(RuntimeError):
     def __init__(self, command: Sequence[str], return_code: int) -> None:
-        self.command = list(command)
         self.return_code = return_code
-        super().__init__(f"Command exited with status {return_code}")
+        super().__init__(
+            f"Command exited with status {return_code}: {' '.join(map(str, command))}"
+        )
 
 
 def run_command(
     command: Sequence[str],
     logger: Logger,
     *,
-    cwd: Path | None = None,
+    cwd: Path,
+    output_level: str = "INFO",
 ) -> None:
-    """Execute a command and stream combined output to console and log."""
-    rendered_command = subprocess.list2cmdline([str(item) for item in command])
-    logger.info(f"Executing: {rendered_command}")
-    if cwd:
-        logger.debug(f"Working directory: {cwd}")
-
+    logger.info(f"Executing: {' '.join(map(str, command))}")
     try:
         process = subprocess.Popen(
-            [str(item) for item in command],
-            cwd=str(cwd) if cwd else None,
+            list(map(str, command)),
+            cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -114,19 +160,21 @@ def run_command(
             bufsize=1,
         )
     except OSError as exc:
-        logger.error(f"Could not start command: {exc}")
+        logger.error(f"Unable to start command: {exc}")
         raise
 
     assert process.stdout is not None
     try:
-        for output_line in process.stdout:
-            output_line = output_line.rstrip("\r\n")
-            if output_line:
-                # Command output is retained verbatim apart from the log prefix.
-                logger.info(f"  {output_line}")
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\r\n")
+            if line:
+                if output_level == "TEST":
+                    logger.test(f"  {line}")
+                else:
+                    logger.info(f"  {line}")
     except KeyboardInterrupt:
-        logger.warning("Interrupt received; stopping the active command.")
-        process.send_signal(signal.SIGTERM)
+        logger.warning("Interrupt received; terminating active command.")
+        process.terminate()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -137,269 +185,161 @@ def run_command(
         process.stdout.close()
 
     return_code = process.wait()
-    if return_code != 0:
+    if return_code:
         logger.error(f"Command failed with exit code {return_code}.")
         raise CommandFailure(command, return_code)
-
     logger.info("Command completed successfully.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build, verify, test and optionally publish the COBOL CI image."
+        description="Build and test the COBOL application inside the prebuilt BuildPiper container."
     )
     parser.add_argument(
         "--context",
-        default=".",
-        help="Project directory and Docker build context (default: current directory).",
-    )
-    parser.add_argument(
-        "--dockerfile",
-        default="Dockerfile",
-        help="Dockerfile path relative to the build context (default: Dockerfile).",
-    )
-    parser.add_argument(
-        "--image",
-        default="cobol-build-agent:ubuntu26",
-        help="Local image name and tag.",
-    )
-    parser.add_argument(
-        "--push-to",
-        help="Optional full registry image reference to tag and push after validation.",
+        default=None,
+        help="Project directory. Defaults to the directory containing this script.",
     )
     parser.add_argument(
         "--log-file",
-        help="Log file path (default: <context>/logs/image-build-<timestamp>.log).",
+        help="Log file path (default: <project>/logs/cobol-validation-<timestamp>.log).",
     )
     parser.add_argument(
         "--skip-app-tests",
         action="store_true",
-        help="Build and verify the image without compiling/testing the COBOL application.",
+        help="Skip COBOL compilation, application execution and automated tests.",
     )
-    parser.add_argument(
-        "--allow-untested-push",
-        action="store_true",
-        help="Explicitly allow --push-to when --skip-app-tests is also supplied.",
-    )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Disable ANSI colors in console output.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable additional diagnostic log messages.",
-    )
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI console colors.")
+    parser.add_argument("--debug", action="store_true", help="Enable diagnostic debug logs.")
     return parser.parse_args()
 
 
-def validate_project(context: Path, dockerfile: Path, args: argparse.Namespace) -> None:
-    if not context.is_dir():
-        raise ValueError(f"Project/build-context directory does not exist: {context}")
-    if not dockerfile.is_file():
-        raise ValueError(f"Dockerfile does not exist: {dockerfile}")
-    if not args.image.strip():
-        raise ValueError("--image cannot be empty.")
-    if args.push_to is not None and not args.push_to.strip():
-        raise ValueError("--push-to cannot be empty.")
-    if args.push_to and args.skip_app_tests and not args.allow_untested_push:
-        raise ValueError(
-            "Refusing to push an untested image. Remove --skip-app-tests or "
-            "explicitly add --allow-untested-push."
-        )
+def resolve_project(args: argparse.Namespace) -> Path:
+    if args.context is None:
+        return Path(__file__).resolve().parent
+    context = Path(args.context).expanduser()
+    return context.resolve() if context.is_absolute() else (Path.cwd() / context).resolve()
 
-    if not args.skip_app_tests:
-        required_files = [
-            "Makefile",
-            "src/main.cob",
-            "src/validate-transaction.cob",
-            "src/validate-account.cob",
-            "src/check-transaction-limit.cob",
-            "src/calculate-service-fee.cob",
-            "src/update-account.cob",
-            "copybooks/account-record.cpy",
-            "copybooks/account-table.cpy",
-            "copybooks/transaction-record.cpy",
-            "tests/test.sh",
-            "scripts/create-sample-data.py",
-        ]
-        missing = [item for item in required_files if not (context / item).is_file()]
+
+def validate_project(project: Path, skip_app_tests: bool, logger: Logger) -> None:
+    if not project.is_dir():
+        raise ValueError(f"Project directory does not exist: {project}")
+
+    required_files = [
+        "Makefile",
+        "src/main.cob",
+        "src/validate-transaction.cob",
+        "src/validate-account.cob",
+        "src/check-transaction-limit.cob",
+        "src/calculate-service-fee.cob",
+        "src/update-account.cob",
+        "copybooks/account-record.cpy",
+        "copybooks/account-table.cpy",
+        "copybooks/transaction-record.cpy",
+        "tests/test.sh",
+        "scripts/create-sample-data.py",
+    ]
+    if not skip_app_tests:
+        missing = [name for name in required_files if not (project / name).is_file()]
         if missing:
-            raise ValueError(
-                "Required project files are missing: " + ", ".join(missing)
-            )
+            raise ValueError("Required project files are missing: " + ", ".join(missing))
+    logger.pass_("Project structure validated.")
 
 
-def verify_image(docker: str, image: str, logger: Logger) -> None:
-    """Check OS release and the actual required commands inside the image."""
-    verify_script = r"""
-set -Eeuo pipefail
-grep -q 'VERSION_ID="26.04"' /etc/os-release
-cobc --version
-gcc --version | head -n 1
-make --version | head -n 1
-python3 --version
-git --version
-for tool in bash curl wget tar gzip sha256sum; do
-    command -v "$tool" >/dev/null || {
-        echo "Required command missing: $tool" >&2
-        exit 1
-    }
-done
-"""
-    run_command(
-        [
-            docker, "run", "--rm",
-            "--entrypoint", "/bin/bash",
-            image, "-lc", verify_script,
-        ],
-        logger,
-    )
-
-
-def test_application_in_temporary_copy(
-    docker: str, image: str, project: Path, logger: Logger
-) -> None:
-    """
-    Test an isolated project copy so `make clean` cannot remove the user's
-    existing build outputs, reports or audit log.
-    """
-    ignored = shutil.ignore_patterns(
-        ".git", ".venv", "venv", "__pycache__", "*.pyc",
-        "build", "logs", "reports", "artifacts",
-    )
-
-    with tempfile.TemporaryDirectory(prefix="cobol-agent-test-") as temp_dir:
-        test_project = Path(temp_dir) / "workspace"
-        shutil.copytree(project, test_project, ignore=ignored)
-        logger.info("Running COBOL compile and tests in an isolated temporary copy.")
-        test_script = (
-            "set -Eeuo pipefail; "
-            "make clean; "
-            "make build; "
-            "make data; "
-            "./build/banking-app; "
-            "bash tests/test.sh"
+def validate_runtime(logger: Logger) -> None:
+    # These dependencies are expected to be baked into the prebuilt execution image.
+    required_commands = ["cobc", "gcc", "make", "python3", "bash"]
+    missing = [name for name in required_commands if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(
+            "Required tools are missing from the running container: "
+            + ", ".join(missing)
+            + ". Add them to the BuildPiper execution image."
         )
-        run_command(
-            [
-                docker, "run", "--rm",
-                "--mount", f"type=bind,source={test_project},target=/workspace",
-                "--workdir", "/workspace",
-                "--entrypoint", "/bin/bash",
-                image, "-lc", test_script,
-            ],
-            logger,
-        )
+    logger.pass_("Required runtime tools are available in the current container.")
+    for command in required_commands:
+        logger.debug(f"{command}: {shutil.which(command)}")
 
-    logger.info("Temporary test workspace removed; original project files were preserved.")
+
+def run_application(project: Path, logger: Logger, summary: RunSummary) -> None:
+    stages = [
+        ("make clean", ["make", "clean"], "INFO"),
+        ("make build", ["make", "build"], "INFO"),
+        ("make data", ["make", "data"], "INFO"),
+        ("Application execution", ["./build/banking-app"], "TEST"),
+        ("Automated test suite", ["bash", "tests/test.sh"], "TEST"),
+    ]
+    for name, command, level in stages:
+        with summary.stage(name):
+            if name == "Application execution":
+                logger.info("Running COBOL banking application.")
+            elif name == "Automated test suite":
+                logger.info("Running automated test suite.")
+            else:
+                logger.info(f"Preparing application: {name}")
+            run_command(command, logger, cwd=project, output_level=level)
 
 
 def main() -> int:
     args = parse_args()
-    project = Path(args.context).expanduser().resolve()
-
-    # Validate the project directory before creating a log directory inside it.
-    if not project.is_dir():
-        print(f"[ERROR] Project directory does not exist: {project}", file=sys.stderr)
-        return 1
-
+    project = resolve_project(args)
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    if args.log_file:
-        log_path = Path(args.log_file).expanduser().resolve()
-    else:
-        log_path = project / "logs" / f"image-build-{timestamp}.log"
+    log_path = (
+        Path(args.log_file).expanduser().resolve()
+        if args.log_file
+        else project / "logs" / f"cobol-validation-{timestamp}.log"
+    )
 
     try:
-        logger = Logger(
-            log_path,
-            use_color=not args.no_color,
-            debug=args.debug,
-        )
+        logger = Logger(log_path, use_color=not args.no_color, debug=args.debug)
     except OSError as exc:
         print(f"[ERROR] Cannot initialize log file {log_path}: {exc}", file=sys.stderr)
         return 1
 
+    summary = RunSummary(logger)
+    exit_code = 1
+
     try:
         logger.info("============================================================")
-        logger.info("Starting COBOL BuildPiper agent image workflow.")
+        logger.info("Starting COBOL application validation in the current container.")
         logger.info(f"Project context: {project}")
+        logger.info(f"Current working directory: {Path.cwd()}")
+        logger.info(f"Script location: {Path(__file__).resolve()}")
         logger.info(f"Log file: {log_path}")
+        logger.info("Dockerfile evaluation and Docker image build are disabled.")
 
-        dockerfile_arg = Path(args.dockerfile).expanduser()
-        dockerfile = (
-            dockerfile_arg.resolve()
-            if dockerfile_arg.is_absolute()
-            else (project / dockerfile_arg).resolve()
-        )
-        validate_project(project, dockerfile, args)
+        with summary.stage("Project validation"):
+            validate_project(project, args.skip_app_tests, logger)
 
-        docker = shutil.which("docker")
-        if not docker:
-            raise RuntimeError("Docker CLI not found. Install Docker and add it to PATH.")
+        with summary.stage("Runtime dependency validation"):
+            validate_runtime(logger)
 
-        # Step 2: Check Docker daemon and build the image.
-        run_command([docker, "version"], logger)
-        run_command(
-            [
-                docker, "build",
-                "--pull",
-                "--file", str(dockerfile),
-                "--tag", args.image,
-                str(project),
-            ],
-            logger,
-        )
-
-        # Step 3: Verify Ubuntu 26.04 and required dependencies in the image.
-        verify_image(docker, args.image, logger)
-
-        # Step 4: Compile and test the COBOL application.
         if args.skip_app_tests:
-            logger.warning("COBOL application compilation and tests were skipped.")
+            logger.warning("COBOL application build and tests were skipped.")
+            summary.skipped("COBOL application tests", "Skipped by --skip-app-tests")
         else:
-            test_application_in_temporary_copy(docker, args.image, project, logger)
+            run_application(project, logger, summary)
 
-        # Step 5: Publish only after successful checks/tests.
-        if args.push_to:
-            run_command([docker, "tag", args.image, args.push_to], logger)
-            run_command([docker, "push", args.push_to], logger)
-            logger.info(f"Image successfully pushed: {args.push_to}")
-        else:
-            logger.info("No registry push requested; image remains available locally.")
-
-        # Step 6: Summarize verified dependencies.
-        logger.info(
-            "Verified: Ubuntu 26.04, GnuCOBOL, GCC, Make, Python 3, Git, "
-            "Bash, curl, wget, tar, gzip and sha256sum."
-        )
-
-        # Step 7: Show the image reference and suggested BuildPiper commands.
-        buildpiper_image = args.push_to or args.image
-        logger.info("BuildPiper image configuration:")
-        logger.info(f"  Image reference: {buildpiper_image}")
-        logger.info("  Suggested pipeline commands:")
-        logger.info("    make clean && make build && make data")
-        logger.info("    ./build/banking-app")
-        logger.info("    bash tests/test.sh")
-        logger.info("Workflow completed successfully.")
-        logger.info("============================================================")
-        return 0
+        logger.pass_("COBOL application validation completed successfully.")
+        exit_code = 0
 
     except KeyboardInterrupt:
         logger.error("Execution interrupted by user.")
-        return 130
+        exit_code = 130
     except CommandFailure as exc:
-        logger.error(f"Workflow stopped because a command failed (exit {exc.return_code}).")
-        return exc.return_code or 1
+        logger.error(str(exc))
+        logger.error("Workflow terminated.")
+        exit_code = exc.return_code or 1
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error(str(exc))
         logger.error("Workflow terminated.")
-        return 1
+        exit_code = 1
     finally:
-        logger.info(f"Execution log saved to: {log_path}")
+        summary.finish("PASSED" if exit_code == 0 else "FAILED")
+        summary.print_summary(log_path)
         logger.close()
+
+    return exit_code
 
 
 if __name__ == "__main__":

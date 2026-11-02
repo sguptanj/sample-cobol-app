@@ -2,11 +2,10 @@
 FROM ubuntu:26.04
 
 LABEL maintainer="BuildPiper"
-LABEL description="Ubuntu 26.04 base image with GnuCOBOL CI/CD dependencies"
+LABEL description="Ubuntu 26.04 COBOL CI/CD execution environment"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install build and runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gnucobol \
     build-essential \
@@ -15,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     git \
+    docker.io \
     bash \
     curl \
     wget \
@@ -30,12 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Verify installed dependencies
 RUN cobc --version && \
     gcc --version && \
     make --version && \
     python3 --version && \
-    git --version
+    git --version && \
+    docker --version
 
 WORKDIR /workspace
 

@@ -83,6 +83,22 @@ Each transaction is validated before processing:
 
 Rejected transactions are recorded with corresponding error codes in the transaction processing output.
 
+
+## Transaction Error Codes
+
+The banking application uses error codes to identify rejected transactions.
+
+| Error Code | Description | Reason |
+|---|---|---|
+| `ERR-001` | Invalid Transaction Type | Unsupported transaction code provided |
+| `ERR-003` | Invalid Account | Customer account does not exist |
+| `ERR-004` | Insufficient Balance | Account does not have sufficient funds |
+| `ERR-005` | Business Validation Failure | Transaction rejected by an additional business validation rule |
+
+Rejected transactions are logged with their corresponding error codes for troubleshooting and audit purposes.
+
+
+
 ## Execute application
 
 make run
